@@ -2314,8 +2314,16 @@ window.Quarto = {
 <body class="quarto-light">
 
 <div id="quarto-content" class="page-columns page-rows-contents page-layout-article">
-<div id="quarto-margin-sidebar" class="sidebar margin-sidebar zindex-bottom">
-  
+<div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+  <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#setup" id="toc-setup" class="nav-link active" data-scroll-target="#setup"><span class="header-section-number">1</span> Setup</a></li>
+  <li><a href="#calculate-power" id="toc-calculate-power" class="nav-link" data-scroll-target="#calculate-power"><span class="header-section-number">2</span> Calculate Power</a></li>
+  <li><a href="#show-results" id="toc-show-results" class="nav-link" data-scroll-target="#show-results"><span class="header-section-number">3</span> Show Results</a></li>
+  </ul>
+</nav>
 </div>
 <main class="content" id="quarto-document-content">
 
@@ -2357,6 +2365,8 @@ window.Quarto = {
 </header>
 
 
+<section id="setup" class="level1" data-number="1">
+<h1 data-number="1"><span class="header-section-number">1</span> Setup</h1>
 <p>Load required packages.</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb1"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(pwrss)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
@@ -2391,6 +2401,9 @@ Attaching package: &#39;pwrss&#39;</code></pre>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb6"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>cond[, r2 <span class="sc">:</span><span class="er">=</span> ( d <span class="sc">/</span> <span class="fu">sqrt</span>(d<span class="sc">^</span><span class="dv">2</span> <span class="sc">+</span> <span class="dv">4</span>) ) <span class="sc">^</span><span class="dv">2</span>] <span class="do">## convert d to R^2</span></span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </div>
+</section>
+<section id="calculate-power" class="level1" data-number="2">
+<h1 data-number="2"><span class="header-section-number">2</span> Calculate Power</h1>
 <p>Use a loop and calculate all power analyses. <span class="math inline">\(k = 5\)</span> because we assume five predictors in the regression models: three dummy codes to capture every combination of 2 x 2 strata, 1 for the outcome at baseline (continuous, controll variable), and 1 for the dummy code for the treatment condition. <span class="math inline">\(m = 1\)</span> because we are only interested in testing the treatment condition. The attrition rate is the proportion of participants that drop out of the study. We adjust by this so that we are viewing the total sample size needed.</p>
 <p>for the <span class="math inline">\(f^2\)</span> effect size, we take the assumed do to <span class="math inline">\(R^2\)</span> conversion, and additionally subtract the variance in the outcome after intervention we expect to be accounted for by controlling for the outcome at baseline, that is:</p>
 <p><span class="math display">\[
@@ -2409,7 +2422,10 @@ f^2 = \frac{R^2_{from~d}}{1 - R^2_{from~d} - r^2_{baseline-post~correlation}}
 <span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>cond[, alpha <span class="sc">:</span><span class="er">=</span> <span class="fu">factor</span>(alpha)]</span>
 <span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>cond[, power <span class="sc">:</span><span class="er">=</span> <span class="fu">factor</span>(power)]</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </div>
-<p>Make a graph of the results.</p>
+</section>
+<section id="show-results" class="level1" data-number="3">
+<h1 data-number="3"><span class="header-section-number">3</span> Show Results</h1>
+<p>Make a graph of the results and save to PDF and PNG for use in publications.</p>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>power <span class="ot">&lt;-</span> <span class="fu">ggplot</span>(cond, <span class="fu">aes</span>(attrition, N, <span class="at">colour =</span> r)) <span class="sc">+</span> </span>
 <span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">geom_line</span>() <span class="sc">+</span> <span class="fu">geom_point</span>() <span class="sc">+</span></span>
@@ -2427,9 +2443,10 @@ f^2 = \frac{R^2_{from~d}}{1 - R^2_{from~d} - r^2_{baseline-post~correlation}}
 </figure>
 </div>
 </div>
-<div class="sourceCode cell-code" id="cb9"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ggsave</span>(<span class="st">&quot;PiP-P2P_Power.pdf&quot;</span>, <span class="at">plot =</span> power, <span class="at">width =</span> <span class="dv">6</span>, <span class="at">height =</span> <span class="dv">6</span>)</span>
-<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ggsave</span>(<span class="st">&quot;PiP-P2P_Power.png&quot;</span>, <span class="at">plot =</span> power, <span class="at">width =</span> <span class="dv">6</span>, <span class="at">height =</span> <span class="dv">6</span>, <span class="at">dpi =</span> <span class="dv">600</span>)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
+<div class="sourceCode cell-code" id="cb9"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ggsave</span>(<span class="st">&quot;power.pdf&quot;</span>, <span class="at">plot =</span> power, <span class="at">width =</span> <span class="dv">6</span>, <span class="at">height =</span> <span class="dv">6</span>)</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ggsave</span>(<span class="st">&quot;power.png&quot;</span>, <span class="at">plot =</span> power, <span class="at">width =</span> <span class="dv">6</span>, <span class="at">height =</span> <span class="dv">6</span>, <span class="at">dpi =</span> <span class="dv">600</span>)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </div>
+</section>
 
 </main>
 <!-- /main column -->

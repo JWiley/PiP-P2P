@@ -13,6 +13,7 @@ format:
     self-contained: true
 ---
 
+# Setup
 
 Load required packages.
 
@@ -51,6 +52,9 @@ to convert $d$ to $R^2$.
 cond[, r2 := ( d / sqrt(d^2 + 4) ) ^2] ## convert d to R^2
 ```
 
+
+# Calculate Power
+
 Use a loop and calculate all power analyses.
 $k = 5$ because we assume five predictors in the regression models: three dummy codes to capture every combination of 2 x 2 strata,
 1 for the outcome at baseline (continuous, controll variable), 
@@ -83,7 +87,9 @@ cond[, power := factor(power)]
   
 ```
 
-Make a graph of the results.
+# Show Results
+
+Make a graph of the results and save to PDF and PNG for use in publications.
 
 ```{r}
 #| fig.width: 6
@@ -98,7 +104,7 @@ power <- ggplot(cond, aes(attrition, N, colour = r)) +
 
 print(power)
 
-ggsave("PiP-P2P_Power.pdf", plot = power, width = 6, height = 6)
-ggsave("PiP-P2P_Power.png", plot = power, width = 6, height = 6, dpi = 600)
+ggsave("power.pdf", plot = power, width = 6, height = 6)
+ggsave("power.png", plot = power, width = 6, height = 6, dpi = 600)
 
 ```
