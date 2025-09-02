@@ -1,0 +1,906 @@
+---
+title: "PiP-P2P Analysis"
+author:
+  - name: "Joshua F. Wiley"
+    email: "joshua.wiley@monash.edu"
+    affiliation: "Monash University"
+date: "2025-9-02"
+toc: true
+number-sections: true
+format: 
+  html: 
+    code-fold: true
+    self-contained: true
+---
+
+# SETUP
+
+## PACKAGES
+
+Load required packages and a few setup functions.
+
+```{r}
+#| label: packages
+#| warning: false
+#| message: false
+
+## graphics packages
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(visreg)
+
+## tools and miscellaneous packages
+library(JWileymisc)
+library(extraoperators)
+library(testthat)
+library(readxl)
+library(writexl)
+library(REDCapR)
+library(keyring)
+
+## data related packages
+library(reshape2)
+library(data.table)
+
+## modelling packages
+library(quantreg)
+library(mice)
+library(mitml)
+library(boot)
+library(broom)
+
+## for reliabilities
+library(psych)
+
+## for formating and rendering
+library(knitr)
+library(quarto)
+
+```
+
+Some options.
+
+```{r}
+#| label: setup
+
+## set knitr to never cache a chunk
+## this is to ensure that the code is always run and not cached
+knitr::opts_chunk$set(cache = FALSE)
+
+options(stringsAsFactors = FALSE)
+
+## set the timezone to Melbourne
+Sys.setenv(TZ = "Australia/Melbourne")
+
+## set to TRUE to re-run models, FALSE to use existing results
+refit <- TRUE
+
+## plotting options
+theme_set(theme_pubr())
+
+## possible analysis contigencies
+contingencies <- data.table(
+  Code = c("000", "010", "001", "011", "100", "110", "101", "111"),
+  Labels = c(
+  "normal linear regression on complete cases",
+  "quantile linear regression on complete cases",
+  "normal linear regression on complete cases with 20,000 bootstraps for inference",
+  "quantile linear regression on complete cases with 20,000 bootstraps for inference",
+  "normal linear regression on 100 multiply imputed datasets",
+  "quantile linear regression on 100 multiply imputed datasets",
+  "normal linear regression, 20,000 bootstraps with a single imputation nested within each bootstrap for inference",
+  "quantile linear regression, 20,000 bootstraps with a single imputation nested within each bootstrap for inference"))
+
+```
+
+## Custom Functions
+
+```{r}
+#| label: functions
+
+linear_regression <- function(formula, basevar, data) {
+  used <- copy(data)
+  scaling <- sd(used[[basevar]], na.rm = TRUE)
+  m <- lm(formula, data = used)
+  co <- as.data.table(tidy(m, conf.int = TRUE))
+
+  est <- co[term == "cond", estimate]
+  lcl <- co[term == "cond", conf.low]
+  ucl <- co[term == "cond", conf.high]
+  pvl <- co[term == "cond", p.value]
+
+  std_est <- abs(est) / scaling
+  std_lcl <- abs(lcl) / scaling
+  std_ucl <- abs(ucl) / scaling
+
+  n_used <- nobs(m)
+
+  # output
+  c("N_total" = n_total,
+    "N_analyzed" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "CI_low" = lcl,
+    "CI_high" = ucl,
+    "p_value" = pvl,
+    "Std_Effect" = std_est,
+    "Std_CI_low" = std_lcl,
+    "Std_CI_high" = std_ucl)
+}
+
+linear_regression_imp <- function(formula, basevar, data) {
+  used <- copy(data)
+
+  impd <- mice(
+    used[, mainvars, with = FALSE], m = m,
+    method = "pmm", maxit = 30, 
+    printFlag = FALSE, seed = 12345)
+
+  scaling <- mean(sapply(complete(impd, "all"), \(x) sd(x[[basevar]])))
+
+  m <- with(impd, lm(as.formula(formula)))
+  sm <- summary(pool(m, dfcom = n_total - 6), conf.int = TRUE)
+
+  rowc <- which(sm$term == "cond")
+
+  est <- sm$estimate[rowc]
+  lcl <- sm$conf.low[rowc]
+  ucl <- sm$conf.high[rowc]
+  pvl <- sm$p.value[rowc]
+
+  std_est <- abs(est) / scaling
+  std_lcl <- abs(lcl) / scaling
+  std_ucl <- abs(ucl) / scaling
+
+  n_used <- sm$df[rowc]
+
+  # output
+  c("N_total" = n_total,
+    "df" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "CI_low" = lcl,
+    "CI_high" = ucl,
+    "p_value" = pvl,
+    "Std_Effect" = std_est,
+    "Std_CI_low" = std_lcl,
+    "Std_CI_high" = std_ucl)
+}
+
+linear_regression_boot <- function(formula, basevar, data) {
+  used <- copy(data)
+  scaling <- sd(used[[basevar]], na.rm = TRUE)
+  m <- lm(formula, data = used)
+
+  est <- coef(m)[["cond"]]
+  std_est <- abs(est) / scaling
+
+  n_used <- nobs(m)
+
+  # output
+  c("N_analyzed" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "Std_Effect" = std_est)
+}
+
+linear_regression_boot_imp <- function(formula, basevar, data, seed) {
+  used <- copy(data)
+
+  impd <- mice(
+    used[, mainvars, with = FALSE], m = 1,
+    method = "pmm", maxit = 30, 
+    printFlag = FALSE, seed = seed)
+
+  used <- complete(impd, 1)
+
+  scaling <- sd(used[[basevar]], na.rm = TRUE)
+  m <- lm(formula, data = used)
+
+  est <- coef(m)[["cond"]]
+  std_est <- abs(est) / scaling
+
+  n_used <- nobs(m)
+
+  # output
+  c("N_analyzed" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "Std_Effect" = std_est)
+}
+
+
+quantile_regression <- function(formula, basevar, data) {
+  used <- copy(data)
+  scaling <- mad(used[[basevar]], constant = 1.4826, na.rm = TRUE)
+  m <- rq(formula, data = used, tau = 0.5, ci = TRUE)
+  sm <- summary(m, se = "nid")
+
+  est <- sm$coefficients["cond", "Value"]
+  lcl <- coef(m)["cond", "lower bd"]
+  ucl <- coef(m)["cond", "upper bd"]
+  pvl <- sm$coefficients["cond", "Pr(>|t|)"]
+
+  std_est <- abs(est) / scaling
+  std_lcl <- abs(lcl) / scaling
+  std_ucl <- abs(ucl) / scaling
+
+  n_used <- nrow(m$model)
+
+  # output
+  c("N_total" = n_total,
+    "N_analyzed" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "CI_low" = lcl,
+    "CI_high" = ucl,
+    "p_value" = pvl,
+    "Std_Effect" = std_est,
+    "Std_CI_low" = std_lcl,
+    "Std_CI_high" = std_ucl)
+}
+
+vcov.rq <- \(object, ...) summary(object, se = "nid", covariance = TRUE)$cov
+
+quantile_regression_imp <- function(formula, basevar, data) {
+  used <- copy(data)
+
+  impd <- mice(
+    used[, mainvars, with = FALSE], m = m,
+    method = "pmm", maxit = 30, 
+    printFlag = FALSE, seed = 12345)
+
+  scaling <- mean(sapply(complete(impd, "all"), \(x) mad(x[[basevar]], constant = 1.4826)))
+
+  m <- with(mids2mitml.list(impd), rq(as.formula(formula), tau = 0.5))
+  sm <- testEstimates(m, df.com = n_total - 6)
+  ci <- confint(sm)
+
+  est <- sm$estimates["cond", "Estimate"]
+  lcl <- ci["cond", "2.5 %"]
+  ucl <- ci["cond", "97.5 %"]
+  pvl <- sm$estimates["cond", "P(>|t|)"]
+
+  std_est <- abs(est) / scaling
+  std_lcl <- abs(lcl) / scaling
+  std_ucl <- abs(ucl) / scaling
+
+  n_used <- sm$estimates["cond", "df"]
+
+  # output
+  c("N_total" = n_total,
+    "df" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "CI_low" = lcl,
+    "CI_high" = ucl,
+    "p_value" = pvl,
+    "Std_Effect" = std_est,
+    "Std_CI_low" = std_lcl,
+    "Std_CI_high" = std_ucl)
+}
+
+quantile_regression_boot <- function(formula, basevar, data) {
+  used <- copy(data)
+  scaling <- mad(used[[basevar]], constant = 1.4826, na.rm = TRUE)
+  m <- rq(formula, data = used, tau = 0.5, ci = FALSE)
+
+  est <- coef(m)[["cond"]]
+  std_est <- abs(est) / scaling
+
+  n_used <- nrow(m$model)
+
+  # output
+  c("N_analyzed" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "Std_Effect" = std_est)
+}
+
+quantile_regression_boot_imp <- function(formula, basevar, data, seed) {
+  used <- copy(data)
+
+  impd <- mice(
+    used[, mainvars, with = FALSE], m = 1,
+    method = "pmm", maxit = 30, 
+    printFlag = FALSE, seed = seed)
+
+  used <- complete(impd, 1)
+
+  scaling <- mad(used[[basevar]], constant = 1.4826, na.rm = TRUE)
+  m <- rq(formula, data = used, tau = 0.5, ci = FALSE)
+
+  est <- coef(m)[["cond"]]
+  std_est <- abs(est) / scaling
+
+  n_used <- nrow(m$model)
+
+  # output
+  c("N_analyzed" = n_used,
+    "Baseline_scaling" = scaling,
+    "Cond_Estimate" = est,
+    "Std_Effect" = std_est)
+}
+```
+
+## LOADING DATA
+
+Load data.
+
+```{r}
+#| label: data
+
+d <- fread("synthetic.csv")
+
+setnames(d, old = names(d), new = tolower(names(d)))
+
+d[, id := as.factor(id)]
+d[, cond := as.integer(cond)]
+d[, strata := as.factor(paste0(age_strata, rcads_strata))]
+
+n_total <- nrow(d)
+
+## number of bootstrap resamples
+R <- 1000 ## leave low for now, change to 20,000 later
+
+## setup bootstrap indices --- these indices used for all
+set.seed(12345)
+boot_indices <- matrix(
+  sample.int(n_total, n_total * R, replace = TRUE),
+  nrow = n_total, ncol = R)
+boot_seeds <- sample.int(1e6, R)
+
+## number of multiple imputations when not nested in bootstraps
+m <- 20 ## leave for now, change to 100 later
+
+## main variables --- condition, strata, and all three primary outcomes
+## at baseline and their primary endpoint assessment
+mainvars <- c("strata", "cond",
+ "pradas_t0", "pradas_t1",
+ "rcads_dep_t0", "rcads_dep_t2",
+ "rcads_anx_t0", "rcads_anx_t2")
+```
+
+# Analysis Decisions
+
+For each category (missing data, outliers, normality and homogeneity) they are coded:
+
+  - 1 = problems
+  - 0 = no problems
+
+## Missing Data
+
+### PRADAS
+```{r}
+#| label: missing pradas
+
+## initialise main model and copy for excluding outliers
+m_noev_pradas <- m_pradas <- lm(pradas_t1 ~ pradas_t0 + strata + cond, data = d)
+
+missing_pradas <- as.integer(((nrow(d) - nobs(m_pradas)) / nrow(d)) >= .10)
+
+sprintf("Is there more than 10%% missing for PRADAS? %s",
+  ifelse(missing_pradas == 1, "Yes, use multiple imputation.",
+  "No, use complete case analysis."))
+```
+
+### Depression
+```{r}
+#| label: missing depression
+
+## initialise main model and copy for excluding outliers
+m_noev_dep <- m_dep <- lm(rcads_dep_t2 ~ rcads_dep_t0 + strata + cond, data = d)
+
+missing_dep <- as.integer(((nrow(d) - nobs(m_dep)) / nrow(d)) >= .10)
+
+sprintf("Is there more than 10%% missing for Depression? %s",
+  ifelse(missing_dep == 1, "Yes, use multiple imputation.",
+  "No, use complete case analysis."))
+```
+
+### Anxiety
+```{r}
+#| label: missing anxiety
+
+## initialise main model and copy for excluding outliers
+m_noev_anx <- m_anx <- lm(rcads_anx_t2 ~ rcads_anx_t0 + strata + cond, data = d)
+
+missing_anx <- as.integer(((nrow(d) - nobs(m_anx)) / nrow(d)) >= .10)
+
+sprintf("Is there more than 10%% missing for Anxiety? %s",
+  ifelse(missing_anx == 1, "Yes, use multiple imputation.",
+  "No, use complete case analysis."))
+```
+
+## Outliers
+
+This is outcome specific because one outcome 
+may have residual outliers and another outcome may not.
+
+### PRADAS 
+```{r}
+#| label: outliers pradas
+
+## extreme value percentile set at the top and bottom 0.5%, equivavlent to
+## qnorm(c(.0005, .9995)) or a z score of about 3.29
+md_noev_pradas <- md_pradas <- modelDiagnostics(m_pradas, 
+  ev.perc = .0005, distr = "normal", standarized = TRUE)
+
+outlier_pradas <- as.integer(nrow(md_pradas$extremeValues) > 0)
+
+sprintf("Are there any extreme values for PRADAS? %s",
+  ifelse(outlier_pradas == 1, "Yes, use quantile regression.",
+  "No, use normal regression."))
+
+if (isTRUE(outlier_pradas == 1)) {
+  ## if outliers, exclude & refit overwriting original copies
+  m_noev_pradas <- update(m_pradas, data = d[-md_pradas$extremeValues$Index, ])
+  md_noev_pradas <- modelDiagnostics(m_noev_pradas, 
+    ev.perc = .0005, distr = "normal", standarized = TRUE)
+}
+```
+
+### Depression 
+```{r}
+#| label: outliers depression
+
+## extreme value percentile set at the top and bottom 0.5%, equivavlent to
+## qnorm(c(.0005, .9995)) or a z score of about 3.29
+md_noev_dep <- md_dep <- modelDiagnostics(m_dep, 
+  ev.perc = .0005, distr = "normal", standarized = TRUE)
+
+outlier_dep <- as.integer(nrow(md_dep$extremeValues) > 0)
+
+sprintf("Are there any extreme values for Depression? %s",
+  ifelse(outlier_dep == 1, "Yes, use quantile regression.",
+  "No, use normal regression."))
+
+if (isTRUE(outlier_dep == 1)) {
+  ## if outliers, exclude & refit overwriting original copies
+  m_noev_dep <- update(m_dep, data = d[-md_dep$extremeValues$Index, ])
+  md_noev_dep <- modelDiagnostics(m_noev_dep, 
+    ev.perc = .0005, distr = "normal", standarized = TRUE)
+}
+```
+
+### Anxiety 
+```{r}
+#| label: outliers anxiety
+
+## extreme value percentile set at the top and bottom 0.5%, equivavlent to
+## qnorm(c(.0005, .9995)) or a z score of about 3.29
+md_noev_anx <- md_anx <- modelDiagnostics(m_anx, 
+  ev.perc = .0005, distr = "normal", standarized = TRUE)
+
+outlier_anx <- as.integer(nrow(md_anx$extremeValues) > 0)
+
+sprintf("Are there any extreme values for Anxiety? %s",
+  ifelse(outlier_anx == 1, "Yes, use quantile regression.",
+  "No, use normal regression."))
+
+if (isTRUE(outlier_anx == 1)) {
+  ## if outliers, exclude & refit overwriting original copies
+  m_noev_anx <- update(m_anx, data = d[-md_anx$extremeValues$Index, ])
+  md_noev_anx <- modelDiagnostics(m_noev_anx, 
+    ev.perc = .0005, distr = "normal", standarized = TRUE)
+}
+```
+
+## Normality and Homogeneity of Variance (NH)
+
+Here assess for normality and homogeneity of variance (abbreviated nh).
+
+### PRADAS
+```{r}
+#| label: nh pradas
+#| fig.width: 10
+#| fig.height: 6
+
+## visual diagnostics
+plot(md_noev_pradas, ncol = 2)
+
+## Shapiro-Wilk test
+normp_pradas <- shapiro.test(residuals(m_noev_pradas))$p.value
+sprintf("Shapiro-Wilk test for PRADAS p-value: %.3f. %s", normp_pradas, 
+  ifelse(normp_pradas > .05, "Normality not violated.", "Normality violated."))
+
+## set manually because of visuals; 1 = problems, 0 = no problems
+nh_pradas <- 0
+```
+
+### Depression
+```{r}
+#| label: nh depression
+#| fig.width: 10
+#| fig.height: 6
+
+## visual diagnostics
+plot(md_noev_dep, ncol = 2)
+
+## Shapiro-Wilk test
+normp_dep <- shapiro.test(residuals(m_noev_dep))$p.value
+sprintf("Shapiro-Wilk test for Depression p-value: %.3f. %s", normp_dep, 
+  ifelse(normp_dep > .05, "Normality not violated.", "Normality violated."))
+
+## set manually because of visuals; 1 = problems, 0 = no problems
+nh_dep <- 1
+```
+
+### Anxiety
+```{r}
+#| label: nh anxiety
+#| fig.width: 10
+#| fig.height: 6
+
+## visual diagnostics
+plot(md_noev_anx, ncol = 2)
+
+## Shapiro-Wilk test
+normp_anx <- shapiro.test(residuals(m_noev_anx))$p.value
+sprintf("Shapiro-Wilk test for Anxiety p-value: %.3f. %s", normp_anx, 
+  ifelse(normp_anx > .05, "Normality not violated.", "Normality violated."))
+
+## set manually because of visuals; 1 = problems, 0 = no problems
+nh_anx <- 0
+```
+
+## Final Decisions
+
+Now we can make decisions on which model to use.
+
+## PRADAS
+```{r}
+#| label: decision pradas
+
+decision_pradas <- paste0(missing_pradas, outlier_pradas, nh_pradas)
+sprintf("The analysis decision code for PRADAS is %s: %s", 
+  decision_pradas,
+  contingencies[Code == decision_pradas, Labels])
+
+```
+
+## Depression
+```{r}
+#| label: decision depression
+
+decision_dep <- paste0(missing_dep, outlier_dep, nh_dep)
+sprintf("The analysis decision code for Depression is %s: %s", 
+  decision_dep,
+  contingencies[Code == decision_dep, Labels])
+
+```
+
+## Anxiety
+```{r}
+#| label: decision anxiety
+
+decision_anx <- paste0(missing_anx, outlier_anx, nh_anx)
+sprintf("The analysis decision code for Anxiety is %s: %s", 
+  decision_anx,
+  contingencies[Code == decision_anx, Labels])
+
+```
+
+# Analyses PRADAS
+
+## normal linear regression on complete cases
+
+```{r}
+#| label: decision 000 pradas
+#| results: asis
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "N_analyzed",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = linear_regression(pradas_t1 ~ pradas_t0 + strata + cond, "pradas_t0", data = d)
+)
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
+
+## quantile linear regression on complete cases
+
+```{r}
+#| label: decision 010 pradas
+#| results: asis
+#| warning: false
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "N_analyzed",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = quantile_regression(pradas_t1 ~ pradas_t0 + strata + cond, "pradas_t0", data = d))
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
+
+## normal linear regression on complete cases with bootstrap inference
+
+```{r}
+#| label: decision 001 pradas
+#| results: asis
+
+tmp_orig_pradas <- linear_regression_boot(
+    pradas_t1 ~ pradas_t0 + cond + strata, "pradas_t0",
+    d)
+
+tmp_boot_pradas <- matrix(NA_real_, nrow = 4L, ncol = R)
+rownames(tmp_boot_pradas) <- names(tmp_orig_pradas)
+
+for (i in seq_len(R)) {
+  tmp_boot_pradas[, i] <- linear_regression_boot(
+    pradas_t1 ~ pradas_t0 + cond + strata, "pradas_t0",
+    d[boot_indices[, i]])
+}
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "N_analyzed",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = c(
+    n_total,
+    tmp_orig_pradas[["N_analyzed"]],
+    tmp_orig_pradas[["Baseline_scaling"]],
+    tmp_orig_pradas[["Cond_Estimate"]],
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .025),
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .975),
+    0 %gele% quantile(tmp_boot_pradas["Cond_Estimate", ], probs = c(.015 / 2, 1 - (.015 / 2))),
+    tmp_orig_pradas[["Std_Effect"]],
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .025),
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .975)
+  ))
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
+
+## quantile linear regression on complete cases with bootstrap inference
+
+```{r}
+#| label: decision 011 pradas
+#| results: asis
+#| warning: false
+
+tmp_orig_pradas <- quantile_regression_boot(
+    pradas_t1 ~ pradas_t0 + cond + strata, "pradas_t0",
+    d)
+
+tmp_boot_pradas <- matrix(NA_real_, nrow = 4L, ncol = R)
+rownames(tmp_boot_pradas) <- names(tmp_orig_pradas)
+
+for (i in seq_len(R)) {
+  tmp_boot_pradas[, i] <- quantile_regression_boot(
+    pradas_t1 ~ pradas_t0 + cond + strata, "pradas_t0",
+    d[boot_indices[, i]])
+}
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "N_analyzed",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = c(
+    n_total,
+    tmp_orig_pradas[["N_analyzed"]],
+    tmp_orig_pradas[["Baseline_scaling"]],
+    tmp_orig_pradas[["Cond_Estimate"]],
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .025),
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .975),
+    0 %gele% quantile(tmp_boot_pradas["Cond_Estimate", ], probs = c(.015 / 2, 1 - (.015 / 2))),
+    tmp_orig_pradas[["Std_Effect"]],
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .025),
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .975)
+  ))
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
+
+## normal linear regression on multiply imputed datasets
+
+```{r}
+#| label: decision 100 pradas
+#| results: asis
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "df",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = linear_regression_imp("pradas_t1 ~ pradas_t0 + strata + cond", "pradas_t0", data = d)
+)
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
+
+
+## quantile linear regression on multiply imputed datasets
+
+```{r}
+#| label: decision 110 pradas
+#| results: asis
+#| warning: false
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "df",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = quantile_regression_imp("pradas_t1 ~ pradas_t0 + strata + cond", "pradas_t0", data = d)
+)
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
+
+## normal linear regression, bootstraps with a single imputation nested within each bootstrap for inference
+
+
+```{r}
+#| label: decision 101 pradas
+#| results: asis
+
+tmp_imp_pradas <- linear_regression_imp(
+    "pradas_t1 ~ pradas_t0 + cond + strata", "pradas_t0",
+    d)
+
+tmp_orig_pradas <- linear_regression_boot(
+    "pradas_t1 ~ pradas_t0 + cond + strata", "pradas_t0",
+    d)
+
+tmp_boot_pradas <- matrix(NA_real_, nrow = 4L, ncol = R)
+rownames(tmp_boot_pradas) <- names(tmp_orig_pradas)
+
+for (i in seq_len(R)) {
+  tmp_boot_pradas[, i] <- linear_regression_boot_imp(
+    pradas_t1 ~ pradas_t0 + cond + strata, "pradas_t0",
+    d[boot_indices[, i]], seed = boot_seeds[i])
+}
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "df",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = c(
+    n_total,
+    tmp_imp_pradas[["df"]],
+    tmp_imp_pradas[["Baseline_scaling"]],
+    tmp_imp_pradas[["Cond_Estimate"]],
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .025),
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .975),
+    0 %gele% quantile(tmp_boot_pradas["Cond_Estimate", ], probs = c(.015 / 2, 1 - (.015 / 2))),
+    tmp_imp_pradas[["Std_Effect"]],
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .025),
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .975)
+  ))
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
+
+## quantile linear regression, bootstraps with a single imputation nested within each bootstrap for inference
+
+```{r}
+#| label: decision 111 pradas
+#| results: asis
+#| warning: false
+
+tmp_imp_pradas <- quantile_regression_imp(
+    "pradas_t1 ~ pradas_t0 + cond + strata", "pradas_t0",
+    d)
+
+tmp_orig_pradas <- quantile_regression_boot(
+    "pradas_t1 ~ pradas_t0 + cond + strata", "pradas_t0",
+    d)
+
+tmp_boot_pradas <- matrix(NA_real_, nrow = 4L, ncol = R)
+rownames(tmp_boot_pradas) <- names(tmp_orig_pradas)
+
+for (i in seq_len(R)) {
+  tmp_boot_pradas[, i] <- quantile_regression_boot_imp(
+    pradas_t1 ~ pradas_t0 + cond + strata, "pradas_t0",
+    d[boot_indices[, i]], seed = boot_seeds[i])
+}
+
+results_pradas <- data.table(
+  Variable = c(
+    "N_total",
+    "df",
+    "Baseline_scaling",
+    "Cond_Estimate",
+    "CI_low",
+    "CI_high",
+    "p_value",
+    "Std_Effect",
+    "Std_CI_low",
+    "Std_CI_high"),
+  Value = c(
+    n_total,
+    tmp_imp_pradas[["df"]],
+    tmp_imp_pradas[["Baseline_scaling"]],
+    tmp_imp_pradas[["Cond_Estimate"]],
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .025),
+    quantile(tmp_boot_pradas["Cond_Estimate", ], probs = .975),
+    0 %gele% quantile(tmp_boot_pradas["Cond_Estimate", ], probs = c(.015 / 2, 1 - (.015 / 2))),
+    tmp_imp_pradas[["Std_Effect"]],
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .025),
+    quantile(tmp_boot_pradas["Std_Effect", ], probs = .975)
+  ))
+
+kable(results_pradas, 
+  digits = 4,
+  caption = "PRADAS at post-intervention (t1).")
+
+```
