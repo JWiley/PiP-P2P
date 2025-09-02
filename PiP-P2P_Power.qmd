@@ -1,0 +1,104 @@
+---
+title: "PiP-P2P Power Analysis"
+author:
+  - name: "Joshua F. Wiley"
+    email: "joshua.wiley@monash.edu"
+    affiliation: "Monash University"
+date: "2025-08-31"
+toc: true
+number-sections: true
+format: 
+  html: 
+    code-fold: false
+    self-contained: true
+---
+
+
+Load required packages.
+
+```{r}
+library(pwrss)
+library(ggplot2)
+library(ggpubr)
+library(data.table)
+library(scales)
+
+```
+
+We have three primary outcomes. To account for multiple comparisons
+we use a conservative $\alpha = .015 < \frac{\alpha = .05}{3}$.
+
+We assume a standardised mean difference of $d = 0.5$.
+
+```{r}
+cond <- as.data.table(
+    expand.grid(
+        alpha = c(.015), 
+        power = c(.95),
+        d = .5,
+        r = c(.5, .55, .6, .65, .7),
+        attrition = c(.15, .20, .25)
+    )
+)
+
+```
+
+Use this paper
+Ruscio, J. (2008). A probability-based measure of effect size: Robustness to base rates and other factors. Psychological Methods, 13(1), 19-30. doi:10.1037/1082-989x.13.1.19
+to convert $d$ to $R^2$.
+
+```{r}
+cond[, r2 := ( d / sqrt(d^2 + 4) ) ^2] ## convert d to R^2
+```
+
+Use a loop and calculate all power analyses.
+$k = 5$ because we assume five predictors in the regression models: three dummy codes to capture every combination of 2 x 2 strata,
+1 for the outcome at baseline (continuous, controll variable), 
+and 1 for the dummy code for the treatment condition. $m = 1$ because we are only interested in testing the treatment condition.
+The attrition rate is the proportion of participants that drop out of the study.
+We adjust by this so that we are viewing the total sample size needed.
+
+for the $f^2$ effect size, we take the assumed do to $R^2$ conversion,
+and additionally subtract the variance in the outcome after intervention
+we expect to be accounted for by controlling for the outcome at baseline,
+that is:
+
+$$
+f^2 = \frac{R^2_{from~d}}{1 - R^2_{from~d} - r^2_{baseline-post~correlation}}
+$$
+
+```{r}
+#| results: hide
+for (i in seq_len(nrow(cond))) {
+  cond[i, N := ceiling(
+    pwrss.f.reg(f2 = cond[i, r2] / (1 - cond[i, r2] - cond[i, r]^2),
+      k = 5, m = 1, power = cond[i, power],
+      alpha = cond[i, alpha])$n / (1 - cond[i, attrition]))]
+}
+
+cond[, r2 := NULL]
+cond[, r := factor(r)]
+cond[, alpha := factor(alpha)]
+cond[, power := factor(power)]
+  
+```
+
+Make a graph of the results.
+
+```{r}
+#| fig.width: 6
+#| fig.height: 6
+#| fig.cap: "Power analysis for the regression model based on different assumptions. Results are adjusted for attrition."
+power <- ggplot(cond, aes(attrition, N, colour = r)) + 
+  geom_line() + geom_point() +
+  annotate("text", x = .245, y = 224, label = "N = 224", vjust = -1) +
+  scale_x_continuous(label = percent_format(accuracy = 1)) + 
+  geom_hline(yintercept = 224, linetype = "dashed") +
+  theme_pubr() + ggtitle("PiP-P2P Power", subtitle = "d = 0.50, alpha = .015")
+
+print(power)
+
+ggsave("PiP-P2P_Power.pdf", plot = power, width = 6, height = 6)
+ggsave("PiP-P2P_Power.png", plot = power, width = 6, height = 6, dpi = 600)
+
+```

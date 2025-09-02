@@ -1,0 +1,179 @@
+---
+title: "PiP-P2P Randomisation"
+author:
+  - name: "Joshua F. Wiley"
+    email: "joshua.wiley@monash.edu"
+    affiliation: "Monash University"
+date: "2025-09-02"
+toc: true
+number-sections: true
+format: 
+  html: 
+    code-fold: false
+    self-contained: true
+---
+
+This script generates a randomisation sequence for a clinical trial
+with two treatment arms and two stratification factors.
+It uses permuted block randomisation.
+
+# Setup
+
+Load required packages.
+
+```{r}
+library(blockrand)
+library(data.table)
+library(DT)
+```
+
+There are two arms:
+
+- cond = 0: control
+- cond = 1: intervention
+
+There are two binary stratification factors:
+
+1.	Adolescent age on parent date of registration
+  a.	≥12 and <16 years old
+  b.	≥16 and ≤17 years old
+2.	Whether the adolescent is elevated on either or both of the RCADS-P subscales. 
+  a.	Depression T-score <65 AND Anxiety T-score <65
+  b.	Depression T-score ≥65 OR Anxiety T-score ≥65
+
+
+```{r}
+
+stage <- "development" # set to production when ready but not shared until after trial
+development.seed <- 12345L
+
+if (isTRUE(stage == "production")) {
+  ## this will be entered by trial statistician
+  ## it will not be public until after the trial completes
+  # production.seed <- ## production seed
+}
+
+## general setup for both development and production
+Ktreatments <- 2
+blocks <- c(4, 6) / Ktreatments
+N <- 600 * Ktreatments
+
+grid <- expand.grid(
+  age_strata  = 0:1,
+  rcads_strata = 0:1)
+
+```
+
+# Development
+
+This is a development or "testing" sequence.
+We can safely share and view this, use it to setup and test the website,
+test randomisation procedures, etc. 
+
+```{r}
+#| label: generate development sequence
+#| results: "asis"
+
+set.seed(development.seed)
+development.rand <- do.call(rbind, lapply(1:nrow(grid), function(i) {
+  stratum <- paste0(
+    grid[i, "age_strata"],
+    grid[i, "rcads_strata"])
+  tmp <- blockrand(
+    n = N,
+    num.levels = Ktreatments,
+    levels = seq_len(Ktreatments) - 1L,
+    id.prefix = '1',
+    stratum = stratum,
+    block.sizes = blocks,
+    block.prefix = stratum)
+  data.table(
+    block_id = as.vector(tmp$block.id),
+    cond = as.integer(tmp$treatment) - 1L,
+    age_strata = grid[i, "age_strata"],
+    rcads_strata = grid[i, "rcads_strata"])
+}))
+
+```
+
+View the development sequence.
+
+```{r}
+#| label: save and view development sequence
+#| results: "asis"
+
+## write development randomisation sequence to a CSV
+fwrite(
+  x = development.rand,
+  file = "PiP-P2P_RandomizationAllocationTable_Development.csv",
+  row.names = FALSE,
+  col.names = TRUE,
+  sep = ",")
+
+## create a sortable table in the HTML file
+DT::datatable(
+  development.rand, rownames = FALSE,
+  filter = "top", options = list(pageLength = 25),
+caption = "development permuted block randomisation sequence")
+
+```
+
+# Production
+
+This is the production sequence -- the one actually used for randomisation.
+This will be made by the trial statistician and will not be shared publicly until after the trial.
+
+```{r}
+#| label: generate production sequence
+#| results: "asis"
+
+if (isTRUE(stage == "production")) {
+
+set.seed(production.seed)
+production.rand <- do.call(rbind, lapply(1:nrow(grid), function(i) {
+  stratum <- paste0(
+    grid[i, "age_strata"],
+    grid[i, "rcads_strata"])
+  tmp <- blockrand(
+    n = N,
+    num.levels = Ktreatments,
+    levels = seq_len(Ktreatments) - 1L,
+    id.prefix = '1',
+    stratum = stratum,
+    block.sizes = blocks,
+    block.prefix = stratum)
+  data.table(
+    block_id = as.vector(tmp$block.id),
+    cond = as.integer(tmp$treatment) - 1L,
+    age_strata = grid[i, "age_strata"],
+    rcads_strata = grid[i, "rcads_strata"])
+}))
+
+}
+
+```
+
+View the production sequence.
+
+```{r}
+#| label: save and view production sequence
+#| results: "asis"
+
+if (isTRUE(stage == "production")) {
+## write production randomisation sequence to a CSV
+fwrite(
+  x = production.rand,
+  file = "PiP-P2P_RandomizationAllocationTable_Production.csv",
+  row.names = FALSE,
+  col.names = TRUE,
+  sep = ",")
+
+## create a sortable table in the HTML file
+DT::datatable(
+  production.rand, rownames = FALSE,
+  filter = "top", options = list(pageLength = 25),
+caption = "production permuted block randomisation sequence")
+
+}
+
+```
