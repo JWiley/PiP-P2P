@@ -19,6 +19,7 @@ renv/
 *.dgm
 *.Rproj
 *.csv
+!synthetic.csv
 *.~
 *.*~
 \#*.*#

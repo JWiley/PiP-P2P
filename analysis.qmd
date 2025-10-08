@@ -4,7 +4,7 @@ author:
   - name: "Joshua F. Wiley"
     email: "joshua.wiley@monash.edu"
     affiliation: "Monash University"
-date: "2025-9-02"
+date: "2025-9-20"
 toc: true
 number-sections: true
 format: 
@@ -116,6 +116,11 @@ linear_regression <- function(formula, basevar, data) {
 
   n_used <- nobs(m)
 
+  pm <- emmeans(m, "cond",
+    at = list(pradas_t0 = mean(used[[basevar]], na.rm = TRUE),
+    strata = names(which.max(prop.table(table(used$strata))))))
+  pm <- as.data.table(pm)
+
   # output
   c("N_total" = n_total,
     "N_analyzed" = n_used,
@@ -126,7 +131,13 @@ linear_regression <- function(formula, basevar, data) {
     "p_value" = pvl,
     "Std_Effect" = std_est,
     "Std_CI_low" = std_lcl,
-    "Std_CI_high" = std_ucl)
+    "Std_CI_high" = std_ucl,
+    "Ctrl_Post_Mean" = pm[cond == 0, emmean],
+    "Ctrl_Post_CI_low" = pm[cond == 0, lower.CL],
+    "Ctrl_Post_CI_high" = pm[cond == 0, upper.CL],
+    "Tx_Post_Mean" = pm[cond == 1, emmean],
+    "Tx_Post_CI_low" = pm[cond == 1, lower.CL],
+    "Tx_Post_CI_high" = pm[cond == 1, upper.CL])
 }
 
 linear_regression_imp <- function(formula, basevar, data) {
