@@ -1,0 +1,693 @@
+---
+title: "PiP-P2P Mediation Analysis"
+author:
+  - name: "Joshua F. Wiley"
+    email: "joshua.wiley@monash.edu"
+    affiliation: "Monash University"
+date: "2026-03-24"
+toc: true
+number-sections: true
+format: 
+  html: 
+    code-fold: true
+    self-contained: true
+---
+
+# SETUP
+
+## PACKAGES
+
+Load required packages and a few setup functions.
+
+```{r}
+#| label: packages
+#| warning: false
+#| message: false
+
+## data and modeling
+library(data.table)
+library(splines)
+library(brms)
+library(mgcv)
+library(mediation)
+library(mice)
+library(posterior)
+
+## for formating and rendering
+library(knitr)
+library(quarto)
+
+```
+
+Some options.
+
+```{r}
+#| label: setup
+
+## set knitr to never cache a chunk
+## this is to ensure that the code is always run and not cached
+knitr::opts_chunk$set(cache = FALSE)
+
+options(stringsAsFactors = FALSE)
+
+## set the timezone to Melbourne
+Sys.setenv(TZ = "Australia/Melbourne")
+
+```
+
+
+```{r}
+#| label: simulation functions
+
+zscore <- function(x) as.numeric(scale(x))
+
+# Monotone piecewise-linear spline:
+# positive coefficients => nonlinear and always increasing.
+positive_spline <- function(x,
+                            knots = c(-0.5, 0.5),
+                            coefs = c(0.30, 0.20, 0.15)) {
+  x <- as.numeric(x)
+  coefs[1] * x +
+    coefs[2] * pmax(x - knots[1], 0) +
+    coefs[3] * pmax(x - knots[2], 0)
+}
+
+mediator_score <- function(m, m_type, trials = NULL) {
+  switch(
+    m_type,
+    continuous = zscore(m),
+    bernoulli  = zscore(m),
+    binomial   = zscore(m / trials),   # use proportion because trials vary
+    count      = zscore(log1p(m))
+  )
+}
+
+mediator_trt_effect <- function(trt, m, m_type, trials = NULL) {
+  if (m_type == "binomial") {
+    mean(m[trt == 1] / trials[trt == 1]) - mean(m[trt == 0] / trials[trt == 0])
+  } else {
+    mean(m[trt == 1]) - mean(m[trt == 0])
+  }
+}
+
+# ---------- mediator model ----------
+
+make_mediator <- function(DT, m_type) {
+  n   <- nrow(DT)
+  trt <- DT$treatment
+  s1  <- DT$strata_1_d1
+  s2  <- DT$strata_2_d1
+  y0  <- DT$baseline_y
+
+  if (m_type == "continuous") {
+    mu <- -0.10 +
+      0.65 * trt +
+      0.20 * s1 + 0.20 * s2 +
+      0.35 * y0 +
+      positive_spline(y0, knots = c(-0.5, 0.5), coefs = c(0.25, 0.15, 0.10))
+
+    return(list(
+      m = mu + stats::rnorm(n, mean = 0, sd = 1.0),
+      trials = NULL
+    ))
+  }
+
+  if (m_type == "bernoulli") {
+    lp <- -0.25 +
+      0.80 * trt +
+      0.20 * s1 + 0.20 * s2 +
+      0.55 * y0
+
+    p <- stats::plogis(lp)
+
+    return(list(
+      m = stats::rbinom(n, size = 1, prob = p),
+      trials = NULL
+    ))
+  }
+
+  if (m_type == "binomial") {
+    trials <- sample(6:9, size = n, replace = TRUE)
+
+    lp <- -0.15 +
+      0.70 * trt +
+      0.20 * s1 + 0.20 * s2 +
+      0.50 * y0
+
+    p <- stats::plogis(lp)
+
+    return(list(
+      m = stats::rbinom(n, size = trials, prob = p),
+      trials = trials
+    ))
+  }
+
+  if (m_type == "count") {
+    eta <- 0.00 +                              # log(1.0)
+      0.35 * trt +
+      0.15 * s1 + 0.15 * s2 +
+      0.22 * y0 +
+      positive_spline(y0, knots = c(-0.5, 0.5), coefs = c(0.18, 0.12, 0.08))
+
+    lambda <- exp(pmin(eta, 2.0))
+
+    return(list(
+      m = stats::rpois(n, lambda = lambda),
+      trials = NULL
+    ))
+  }
+
+  stop("Unknown mediator type: ", m_type)
+}
+
+# ---------- outcome model ----------
+
+make_outcome_generator <- function(DT, m, m_type, y_type, trials = NULL) {
+  n   <- nrow(DT)
+  trt <- DT$treatment
+  s1  <- DT$strata_1_d1
+  s2  <- DT$strata_2_d1
+  y0  <- DT$baseline_y
+
+  mz <- mediator_score(m, m_type, trials)
+
+  # Nonlinear mediator -> outcome association only when BOTH mediator and outcome
+  # are continuous/count.
+  nonlinear_pair <- m_type %in% c("continuous", "count") &&
+    y_type %in% c("continuous", "count")
+
+  if (nonlinear_pair) {
+    m_term <- 0.80 * zscore(
+      positive_spline(
+        mz,
+        knots = c(-0.25, 0.75),
+        coefs = c(0.30, 0.20, 0.15)
+      )
+    )
+  } else if (y_type == "continuous") {
+    m_term <- 0.60 * mz
+  } else if (y_type == "bernoulli") {
+    m_term <- 0.85 * mz
+  } else if (y_type == "count") {
+    m_term <- 0.45 * mz
+  } else {
+    stop("Unknown outcome type: ", y_type)
+  }
+
+  # Fixed random draws so calibration of cor(baseline, outcome) is stable.
+  eps_cont <- stats::rnorm(n, mean = 0, sd = 1.0)
+  u_bin    <- stats::runif(n)
+  u_cnt    <- stats::runif(n)
+
+  function(beta_y0) {
+    if (y_type == "continuous") {
+      eta <- 0.10 * trt +
+        0.12 * s1 + 0.12 * s2 +
+        m_term +
+        beta_y0 * y0
+
+      return(eta + eps_cont)
+    }
+
+    if (y_type == "bernoulli") {
+      eta <- -0.20 +
+        0.10 * trt +
+        0.12 * s1 + 0.12 * s2 +
+        m_term +
+        beta_y0 * y0
+
+      p <- stats::plogis(eta)
+      return(as.integer(u_bin < p))
+    }
+
+    if (y_type == "count") {
+      eta <- 0.15 +
+        0.08 * trt +
+        0.10 * s1 + 0.10 * s2 +
+        m_term +
+        beta_y0 * y0
+
+      lambda <- exp(pmin(eta, 2.0))
+      return(stats::qpois(u_cnt, lambda = lambda))
+    }
+  }
+}
+
+# Choose beta for baseline_y so cor(baseline_y, post outcome) is ~ 0.5.
+choose_beta_y0 <- function(gen_y,
+                           y0,
+                           target_r = 0.50,
+                           grid = seq(0, 2.5, by = 0.05)) {
+
+  cors <- vapply(
+    grid,
+    FUN.VALUE = numeric(1),
+    FUN = function(b) {
+      y <- gen_y(b)
+      if (stats::sd(y) == 0) return(NA_real_)
+      stats::cor(y0, y)
+    }
+  )
+
+  ok <- which(!is.na(cors))
+  best <- ok[which.min(abs(cors[ok] - target_r))]
+
+  list(
+    beta_y0    = grid[best],
+    achieved_r = cors[best]
+  )
+}
+
+# ---------- main simulator ----------
+
+simulate_mediation_data <- function(n = 1000,
+                                    seed = 123,
+                                    target_r = 0.50) {
+  set.seed(seed)
+
+  DT <- data.table(id = seq_len(n))
+
+  # Two fully crossed 2-level strata, dummy coded as 0/1.
+  DT[, `:=`(
+    strata_1 = stats::rbinom(.N, size = 1, prob = 0.5),
+    strata_2 = stats::rbinom(.N, size = 1, prob = 0.5)
+  )]
+
+  DT[, `:=`(
+    strata_1_d1 = as.integer(strata_1 == 1L),
+    strata_2_d1 = as.integer(strata_2 == 1L)
+  )]
+
+  DT[, stratum := factor(paste0("S", strata_1, strata_2))]
+
+  # Single-level treatment assignment, balanced within strata cells.
+  DT[, treatment := sample(rep(c(0L, 1L), length.out = .N)),
+     by = .(strata_1, strata_2)]
+
+  # Baseline outcome covariate.
+  DT[, baseline_y := zscore(
+    stats::rnorm(.N) +
+      0.25 * strata_1_d1 +
+      0.25 * strata_2_d1 +
+      stats::rnorm(.N, sd = 0.75)
+  )]
+
+  # Coding:
+  # mediator: 1=continuous, 2=bernoulli, 3=binomial, 4=count
+  # outcome : 1=continuous, 2=bernoulli, 3=count
+  mediator_types <- c("continuous", "bernoulli", "binomial", "count")
+  outcome_types  <- c("continuous", "bernoulli", "count")
+
+  design <- CJ(m_idx = seq_along(mediator_types),
+               y_idx = seq_along(outcome_types))
+
+  design[, `:=`(
+    mediator_type = mediator_types[m_idx],
+    outcome_type  = outcome_types[y_idx],
+    mediator_name = sprintf("m_%d_%d", m_idx, y_idx),
+    outcome_name  = sprintf("y_%d_%d", m_idx, y_idx),
+    trials_name   = fifelse(
+      mediator_types[m_idx] == "binomial",
+      sprintf("m_trials_%d_%d", m_idx, y_idx),
+      NA_character_
+    ),
+    nonlinear_pair = mediator_types[m_idx] %in% c("continuous", "count") &
+      outcome_types[y_idx] %in% c("continuous", "count")
+  )]
+
+  for (k in seq_len(nrow(design))) {
+    mt <- design$mediator_type[k]
+    yt <- design$outcome_type[k]
+    mn <- design$mediator_name[k]
+    yn <- design$outcome_name[k]
+    tn <- design$trials_name[k]
+
+    med <- make_mediator(DT, m_type = mt)
+    DT[, (mn) := med$m]
+
+    if (!is.na(tn)) {
+      DT[, (tn) := med$trials]
+    }
+
+    gen_y <- make_outcome_generator(
+      DT     = DT,
+      m      = med$m,
+      m_type = mt,
+      y_type = yt,
+      trials = med$trials
+    )
+
+    tuned <- choose_beta_y0(
+      gen_y    = gen_y,
+      y0       = DT$baseline_y,
+      target_r = target_r
+    )
+
+    DT[, (yn) := gen_y(tuned$beta_y0)]
+
+
+    design[k, `:=`(
+      beta_y0        = tuned$beta_y0,
+      achieved_r     = tuned$achieved_r,
+      trt_effect_on_m = mediator_trt_effect(
+        trt    = DT$treatment,
+        m      = med$m,
+        m_type = mt,
+        trials = med$trials
+      ),
+      mediator_mean  = if (mt == "binomial") mean(med$m / med$trials) else mean(med$m),
+      outcome_mean   = mean(DT[[yn]])
+    )]
+  }
+
+  list(
+    data   = DT,
+    design = design
+  )
+}
+
+```
+
+```{r}
+#| label: mediation functions
+
+med_summary <- function(obj) {
+    rbind(
+        c(Estimate = obj[["d0"]], obj[["d0.ci"]]),
+        c(Estimate = obj[["d1"]], obj[["d1.ci"]]),
+        c(Estimate = obj[["d.avg"]], obj[["d.avg.ci"]])
+    )
+}
+
+nie_brms <- function(fit,
+                     treatment_var = "A",
+                     mediator_response = "M",
+                     mediator_predictor = "M",
+                     outcome_response = "Y",
+                     scaling_variable = NULL,
+                     k = 1000L) {
+    tmp <- as.data.table(model.frame(fit))
+
+    if (!treatment_var %in% names(tmp)) {
+        stop("Treatment variable not found in model frame: ", treatment_var)
+    }
+    if (!mediator_response %in% names(tmp)) {
+        stop("Mediator variable not found in model frame: ", mediator_response)
+    }
+    if (!mediator_predictor %in% names(tmp)) {
+        stop("Mediator variable not found in model frame: ", mediator_predictor)
+    }
+    if (!outcome_response %in% names(tmp)) {
+        stop("Outcome variable not found in model frame: ", outcome_response)
+    }
+    if (!is.null(scaling_variable) ) {
+          if (!scaling_variable %in% names(tmp)) {
+              stop("Scaling variable not found in model frame: ", scaling_variable)
+          }
+    }
+
+    txindex <- rep(c(0L, 1L), each = nrow(tmp))
+    tmp <- rbind(tmp, tmp)
+    tmp[txindex == 0, (treatment_var) := 0]
+    tmp[txindex == 1, (treatment_var) := 1]
+
+    tmp2 <- rbind(tmp, tmp)
+    tmp2[, (mediator_response) := as.numeric(get(mediator_response))]
+    # typeof(tmp2[[mediator_response]])
+    txindex2 <- c(txindex, txindex)
+
+    nk <- ndraws(fit)
+    if (nk >= k) {
+        index <- round(seq(from = 1, to = nk, length.out = k))
+        if (!identical(anyDuplicated(index), 0L)) {
+            warning("There were duplicated draws.")
+        }
+    } else {
+        stop("Number of posterior draws (", nk, ") is less than k (", k, ").")
+    }
+
+    # Posterior mediator predictions
+    mdraw <- posterior_predict(
+        fit,
+        newdata = tmp, draw_ids = index,
+        resp =  gsub("\\.|_", "", make.names(mediator_response, unique = TRUE))
+    )
+
+    results <- data.table(
+        NIE0 = rep(NA_real_, length(index)),
+        NIE1 = rep(NA_real_, length(index)),
+        NIE_avg = rep(NA_real_, length(index))
+    )
+
+    for (i in seq_along(index)) {
+        ui <- index[i]
+
+        if (is.null(scaling_variable)) {
+            tmpm <- mdraw[i, ]
+        } else {
+            tmpm <- mdraw[i, ] / tmp[[scaling_variable]]
+        }
+        
+        tmp2[txindex2 == 0, (mediator_predictor) := tmpm]
+        tmp2[txindex2 == 1, (mediator_predictor) := tmpm]
+
+        yhat <- posterior_predict(
+            fit,
+            newdata = tmp2,
+            draw_ids = ui,
+            resp =  gsub("\\.|_", "", make.names(outcome_response, unique = TRUE))
+        )
+
+        results[i, NIE0 := mean(
+            yhat[txindex2 == 0][txindex == 1] -
+                yhat[txindex2 == 0][txindex == 0]
+        )]
+        results[i, NIE1 := mean(
+            yhat[txindex2 == 1][txindex == 1] -
+                yhat[txindex2 == 1][txindex == 0]
+        )]
+
+        results[i, NIE_avg := (NIE0 + NIE1) / 2]
+    }
+    return(results)
+}
+
+```
+
+```{r}
+#| label: run-simulation
+#| results: asis
+
+# Examples:
+# m_1_1 = continuous mediator, continuous outcome y_1_1
+# m_1_2 = continuous mediator, bernoulli outcome y_1_2
+# m_4_3 = count mediator, count outcome y_4_3
+#
+# For binomial mediators, the matching trial count column is:
+# m_trials_3_1, m_trials_3_2, m_trials_3_3
+
+out <- simulate_mediation_data(n = 2000, seed = 2026, target_r = 0.50)
+
+kable(out$design, 
+  digits = 2,
+  caption = "Various mediator and outcome types in simulated data.")
+
+```
+
+This is an example (not run) that can be used to compare 
+the `brms`-based NIE estimation with the `mediate` package.
+
+```{r}
+#| label: comparison mediation
+#| eval: false
+
+brm_2_3 <- brm(
+    bf(m_2_3 ~ treatment + strata_1_d1 + strata_2_d1 + baseline_y) +
+        bf(y_2_3 ~ treatment + m_2_3 + strata_1_d1 + strata_2_d1 + baseline_y) +
+        set_rescor(FALSE),
+    data = out$data,
+    family = list(bernoulli(), poisson()),
+    chains = 4, iter = 4000, warmup = 2000,
+    cores = 4, seed = 20260324L, backend = "cmdstanr",
+    control = list(adapt_delta = 0.95)
+)
+
+summary(brm_2_3)
+
+indeff_2_3 <- nie_brms(
+    fit = brm_2_3,
+    treatment_var = "treatment",
+    mediator_response = "m_2_3",
+    mediator_predictor = "m_2_3",
+    outcome_response = "y_2_3",
+    k = 1000L
+)
+
+posterior_summary(indeff_2_3)
+
+## Design 2_3 with classical GLMs for the `mediate` package.
+glm_m_2_3 <- glm(
+    m_2_3 ~ treatment + strata_1_d1 + strata_2_d1 + baseline_y,
+    data = out$data,
+    family = binomial(link = "logit")
+)
+
+glm_y_2_3 <- glm(
+    y_2_3 ~ treatment + m_2_3 + strata_1_d1 + strata_2_d1 + baseline_y,
+    data = out$data,
+    family = poisson(link = "log")
+)
+
+med_2_3 <- mediate(
+    model.m = glm_m_2_3,
+    model.y = glm_y_2_3,
+    treat = "treatment",
+    mediator = "m_2_3",
+    sims = 1000
+)
+
+summary(med_2_3)
+```
+
+We expect the mediator to be a binomial variable and the trial outcomes
+are typically continuous and expected to be approximately normally distributed. So the most relevant design is 3_1, which is what we focus on here.
+
+```{r}
+#| label: mediation-fit
+
+# Design 3_1
+out$data$prop_m_3_1 <- out$data$m_3_1 / out$data$m_trials_3_1
+
+brm_3_1 <- brm(
+    bf(m_3_1 | trials(m_trials_3_1) ~ treatment + strata_1_d1 + strata_2_d1 + baseline_y) +
+        bf(y_3_1 ~ treatment + s(prop_m_3_1, k = 3) + strata_1_d1 + strata_2_d1 + baseline_y) +
+        set_rescor(FALSE),
+    data = out$data,
+    family = list(binomial(), gaussian()),
+    chains = 4, iter = 2000, warmup = 1000,
+    cores = 4, seed = 20260324L, backend = "cmdstanr",
+    control = list(adapt_delta = 0.95),
+    refresh = 0
+)
+
+summary(brm_3_1)
+
+indeff_3_1 <- nie_brms(
+    fit = brm_3_1,
+    treatment_var = "treatment",
+    mediator_response = "m_3_1",
+    mediator_predictor = "prop_m_3_1",
+    outcome_response = "y_3_1",
+    scaling_variable = "m_trials_3_1",
+    ## just 100 for speed but should be higher
+    ## but should be higher for stable / precise estimates
+    k = 100L 
+)
+
+```
+
+```{r}
+#| label: mediation-output
+#| results: asis
+
+kable(posterior_summary(indeff_3_1), 
+  digits = 2,
+  caption = "NIE (ACME) for control (NIE0), treatment (NIE1), and average (NIE_avg) with 95% credible intervals.")
+
+```
+
+
+# Design 3_1 With Missing Data and Multiple Imputation
+
+To illustrate a simple missing-data workflow for the main `3_1` design, the code
+below first imposes about 10% missingness on the outcome, then uses
+predictive mean matching via `mice` to create 10 imputed datasets using only the
+variables from the analytic model. Each imputed dataset is then analysed with the
+same joint `brms` model, `nie_brms()` is run with `k = 100L` per dataset, and
+the posterior draws are pooled across imputations.
+This code is not evaluated as it is time consuming to run.
+
+```{r}
+#| label: mediation-missing-data
+#| eval: false
+
+## Start from only the variables used in the analytic model.
+mi_data_3_1 <- copy(out$data[, .(
+    treatment,
+    strata_1_d1,
+    strata_2_d1,
+    baseline_y,
+    m_3_1,
+    m_trials_3_1,
+    y_3_1
+)])
+
+## Add about 10% missingness to the outcome.
+set.seed(20260324L)
+mi_data_3_1[sample(.N, size = ceiling(.N * 0.10)), y_3_1 := NA_real_]
+
+## Set up mice so only variables in the analytic model are used.
+mi_method <- mice::make.method(mi_data_3_1)
+mi_method[] <- ""
+mi_method["y_3_1"] <- "pmm"
+
+mi_predictor_matrix <- mice::make.predictorMatrix(mi_data_3_1)
+mi_predictor_matrix[,] <- 0L
+mi_predictor_matrix["y_3_1", c(
+    "treatment",
+    "strata_1_d1",
+    "strata_2_d1",
+    "baseline_y",
+    "m_3_1",
+    "m_trials_3_1"
+)] <- 1L
+
+imp_3_1 <- mice(
+    data = as.data.frame(mi_data_3_1),
+    m = 10,
+    method = mi_method,
+    predictorMatrix = mi_predictor_matrix,
+    maxit = 20,
+    seed = 20260324L,
+    printFlag = FALSE
+)
+
+imp_data_3_1 <- lapply(seq_len(imp_3_1$m), function(i) {
+    DT <- as.data.table(mice::complete(imp_3_1, action = i))
+    DT[, prop_m_3_1 := m_3_1 / m_trials_3_1]
+    DT
+})
+
+fit_3_1_mi <- vector("list", length = length(imp_data_3_1))
+nie_3_1_mi <- vector("list", length = length(imp_data_3_1))
+
+for (i in seq_along(imp_data_3_1)) {
+    fit_3_1_mi[[i]] <- brm(
+        bf(m_3_1 | trials(m_trials_3_1) ~ treatment + strata_1_d1 + strata_2_d1 + baseline_y) +
+            bf(y_3_1 ~ treatment + s(prop_m_3_1, k = 3) + strata_1_d1 + strata_2_d1 + baseline_y) +
+            set_rescor(FALSE),
+        data = imp_data_3_1[[i]],
+        family = list(binomial(), gaussian()),
+        chains = 4, iter = 2000, warmup = 1000,
+        cores = 4, seed = 20260324L + i, backend = "cmdstanr",
+        control = list(adapt_delta = 0.95)
+    )
+
+    nie_3_1_mi[[i]] <- copy(nie_brms(
+        fit = fit_3_1_mi[[i]],
+        treatment_var = "treatment",
+        mediator_response = "m_3_1",
+        mediator_predictor = "prop_m_3_1",
+        outcome_response = "y_3_1",
+        scaling_variable = "m_trials_3_1",
+        k = 100L
+    ))
+
+    nie_3_1_mi[[i]][, imputation := i]
+}
+
+pooled_nie_3_1 <- rbindlist(nie_3_1_mi, use.names = TRUE)
+
+posterior_summary(pooled_nie_3_1[, .(NIE0, NIE1, NIE_avg)])
+
+```
